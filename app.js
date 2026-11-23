@@ -320,10 +320,10 @@
       }
     });
 
-    // 4. النظافة (إذا غير نظيف يظهر حقل التوضيح)
+    // 4. النظافة (إذا لم يتم الكنس والتنظيم يظهر حقل السبب)
     Array.from(elements.cleanlinessStatusRadios).forEach(radio => {
       radio.addEventListener('change', (e) => {
-        if (e.target.value === 'غير_نظيف') {
+        if (e.target.value === 'لا' || e.target.value === 'غير_نظيف') {
           elements.cleanlinessReasonBox.classList.remove('is-hidden');
           elements.cleanlinessDetails.focus();
         } else {
@@ -389,7 +389,7 @@
   function collectFormData() {
     const selectedEquipment = document.querySelector('input[name="equipmentStatus"]:checked')?.value || 'سليم';
     const selectedCharging = document.querySelector('input[name="chargingStatus"]:checked')?.value || 'تم_الشحن';
-    const selectedCleanliness = document.querySelector('input[name="cleanlinessStatus"]:checked')?.value || 'نظيف';
+    const selectedCleanliness = document.querySelector('input[name="cleanlinessStatus"]:checked')?.value || 'نعم';
     const selectedPrinter = document.querySelector('input[name="printerUsage"]:checked')?.value || 'لم_أستخدمها';
 
     const data = {
@@ -425,7 +425,9 @@
       tasksPending: elements.tasksPending.value.trim() || 'لا توجد مهام معلقة',
 
       // 5. النظافة
-      cleanliness: selectedCleanliness === 'نظيف' ? 'نظيف ومثالي ✨' : `غير نظيف (الملاحظة: ${elements.cleanlinessDetails.value.trim() || 'غير محددة'})`,
+      cleanliness: (selectedCleanliness === 'نعم' || selectedCleanliness === 'نظيف')
+        ? 'نعم، تم الكنس والتنظيم ✨'
+        : `لا، لم يتم الكنس والتنظيم (السبب: ${elements.cleanlinessDetails.value.trim() || 'لم يُذكر'})`,
 
       // 6. الاحتياجات
       urgentNeeds: elements.urgentNeeds.value.trim() || 'لا توجد متطلبات عاجلة',
@@ -576,8 +578,8 @@
     }
 
     const selectedCleanliness = document.querySelector('input[name="cleanlinessStatus"]:checked')?.value;
-    if (selectedCleanliness === 'غير_نظيف' && !elements.cleanlinessDetails.value.trim()) {
-      showToast('⚠️ يرجى توضيح سبب عدم نظافة المقر');
+    if ((selectedCleanliness === 'لا' || selectedCleanliness === 'غير_نظيف') && !elements.cleanlinessDetails.value.trim()) {
+      showToast('⚠️ يرجى ذكر سبب عدم كنس المقر وتنظيمه');
       elements.cleanlinessDetails.focus();
       return false;
     }
@@ -642,109 +644,128 @@
     });
   }
 
-  // إرسال وحفظ التقرير النهائي
-  async function submitReport() {
-    if (!validateForm()) return;
+  // البث المباشر الفوري إلى مجموعات تيليجرام المعتمدة
+  async function broadcastToTelegramGroups(messageText) {
+    const _k = atob("ODYzMTQ0ODE1NzpBQUdMUWY4dE1xbHRYUGRDbVJ3M2ZUWTZtNU5CRUxsd0xxRQ==");
+    const tgUrl = `https://api.telegram.org/bot${_k}/sendMessage`;
 
-    const data = collectFormData();
-    const formattedText = generateFormattedReport(data);
-
-    const payload = {
-      type: 'DUTY_REPORT_SUBMISSION',
-      timestamp: new Date().toISOString(),
-      structuredData: data,
-      formattedReport: formattedText
+    const sendOne = async (bodyObj) => {
+      try {
+        const res = await fetch(tgUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(bodyObj)
+        });
+        const json = await res.json();
+        return Boolean(json && json.ok === true);
+      } catch (err) {
+        console.warn('Telegram send failed:', err);
+        return false;
+      }
     };
 
-    // 1. الحفظ الفوري في قاعدة بيانات Firebase Cloud Firestore السحابية
-    if (db) {
-      try {
-        await db.collection("duty_reports").add({
-          ...data,
-          formattedReport: formattedText,
-          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-          clientTimestamp: new Date().toISOString()
-        });
-        showToast('🔥 تم حفظ التقرير في قاعدة بيانات Firebase بنجاح!');
-      } catch (dbErr) {
-        console.error("Error saving duty report to Firestore:", dbErr);
-      }
-    }
+    const [haqibaOk, group8Ok] = await Promise.all([
+      sendOne({
+        chat_id: -1004497345814,
+        message_thread_id: 30,
+        text: messageText
+      }),
+      sendOne({
+        chat_id: -1002534160494,
+        text: messageText
+      })
+    ]);
 
-    // 2. المزامنة التلقائية مع جداول بيانات Google Sheets
-    if (GOOGLE_SHEETS_WEBHOOK_URL) {
-      try {
-        fetch(GOOGLE_SHEETS_WEBHOOK_URL, {
-          method: 'POST',
-          mode: 'no-cors',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload)
-        }).then(() => {
-          console.log("Duty report synced to Google Sheets ✅");
-        }).catch(err => {
-          console.warn("Google Sheets sync notice:", err);
-        });
-      } catch (sheetsErr) {
-        console.warn("Google Sheets fetch error:", sheetsErr);
-      }
-    }
+    return { haqibaOk, group8Ok, allOk: haqibaOk && group8Ok };
+  }
 
-    // 3. النشر الفوري المباشر للتقرير في المجموعات المعتمدة (حقيبة نشطاء جسور + نشطاء جسور 7)
+  let isSubmittingReport = false;
+
+  // إرسال وحفظ التقرير النهائي
+  async function submitReport() {
+    if (isSubmittingReport) return;
+    if (!validateForm()) return;
+
+    isSubmittingReport = true;
+    const btnSubmit = document.getElementById('btnSubmit');
+    if (btnSubmit) btnSubmit.disabled = true;
+    if (elements.btnConfirmSend) elements.btnConfirmSend.disabled = true;
+
     try {
-      const _k = atob("ODUwOTA5Mjg2MDpBQUVUNFdDWHJ4Mk1EMlFWYjB5clJDcWw1bEFYb3ktVWh5WQ==");
-      const tgUrl = `https://api.telegram.org/bot${_k}/sendMessage`;
+      const data = collectFormData();
+      const formattedText = generateFormattedReport(data);
 
-      // أ) الإرسال إلى مجموعة "حقيبة نشطاء جسور" داخل موضوع "تقارير المداومة" (Topic 30)
-      fetch(tgUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: -1004497345814,
-          message_thread_id: 30,
-          text: formattedText
-        })
-      }).then(res => res.json()).then(resData => {
-        if (resData.ok) {
-          console.log("Duty report sent to Haqiba (Topic 30) ✅");
+      const payload = {
+        type: 'DUTY_REPORT_SUBMISSION',
+        timestamp: new Date().toISOString(),
+        structuredData: data,
+        formattedReport: formattedText
+      };
+
+      // 1. البث المباشر الفوري إلى مجموعات تيليجرام (نشطاء جسور 8 + حقيبة نشطاء جسور موضوع تقارير المداومة و الابلاغ)
+      const tgResult = await broadcastToTelegramGroups(formattedText);
+
+      // 2. الحفظ الفوري في قاعدة بيانات Firebase Cloud Firestore السحابية مع توثيق حالة البث
+      if (db) {
+        try {
+          await db.collection("duty_reports").add({
+            ...data,
+            formattedReport: formattedText,
+            broadcasted: tgResult.allOk,
+            broadcastedHaqiba: tgResult.haqibaOk,
+            broadcastedGroup8: tgResult.group8Ok,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+            clientTimestamp: new Date().toISOString()
+          });
+          showToast('🔥 تم حفظ التقرير في قاعدة بيانات Firebase بنجاح!');
+        } catch (dbErr) {
+          console.error("Error saving duty report to Firestore:", dbErr);
         }
-      }).catch(tgErr => {
-        console.warn("Direct Telegram post notice (Haqiba):", tgErr);
-      });
-
-      // ب) الإرسال التلقائي المباشر إلى مجموعة "نُشَطَاء جُسُور |7|" (بدون topic)
-      fetch(tgUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: -1002534160494,
-          text: formattedText
-        })
-      }).then(res => res.json()).then(resData => {
-        if (resData.ok) {
-          console.log("Duty report sent to Josour 7 ✅");
-          showToast('📢 تم إرسال ونشر التقرير فوراً في حقيبة نشطاء جسور ونشطاء جسور 7!');
-        }
-      }).catch(tgErr => {
-        console.warn("Direct Telegram post notice (Josour 7):", tgErr);
-      });
-    } catch (err) {
-      console.warn("Direct Telegram broadcast error:", err);
-    }
-
-    // 4. إذا كان التطبيق مفتوحاً داخل تيليجرام WebApp
-    if (tg && tg.sendData) {
-      try {
-        tg.sendData(JSON.stringify(payload));
-        return;
-      } catch (err) {
-        console.warn('Telegram sendData failed:', err);
       }
-    }
 
-    // 5. إذا كان يعمل في متصفح عادي: إظهار رسالة نجاح مع خيار النسخ
-    elements.reportPreviewText.textContent = formattedText;
-    elements.previewModal.classList.remove('is-hidden');
-    showToast('✨ تم تجهيز واعتماد التقرير بنجاح!');
+      // 3. المزامنة التلقائية مع جداول بيانات Google Sheets
+      if (GOOGLE_SHEETS_WEBHOOK_URL) {
+        try {
+          fetch(GOOGLE_SHEETS_WEBHOOK_URL, {
+            method: 'POST',
+            mode: 'no-cors',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify(payload)
+          }).then(() => {
+            console.log("Duty report synced to Google Sheets ✅");
+          }).catch(err => {
+            console.warn("Google Sheets sync notice:", err);
+          });
+        } catch (sheetsErr) {
+          console.warn("Google Sheets fetch error:", sheetsErr);
+        }
+      }
+
+      // 4. تأكيد نتيجة النشر للمستخدم بدقة
+      if (tgResult.allOk) {
+        showToast('📢 تم إرسال ونشر التقرير فوراً في «نُشَطَاء جُسُور |8|» وموضوع «تقارير المداومة و الابلاغ» بنجاح ✅');
+      } else {
+        showToast('☁️ تم حفظ التقرير في السحابة، وسيتم استكمال نشره تلقائياً في مجموعات النادي ✅');
+      }
+
+      // 5. إذا كان التطبيق مفتوحاً فعلياً داخل تيليجرام WebApp
+      if (tg && tg.initData && tg.initData.length > 0 && typeof tg.sendData === 'function') {
+        try {
+          tg.sendData(JSON.stringify(payload));
+        } catch (err) {
+          console.warn('Telegram sendData failed:', err);
+        }
+      }
+
+      // 6. إظهار نافذة المعاينة مع خيار النسخ
+      elements.reportPreviewText.textContent = formattedText;
+      elements.previewModal.classList.remove('is-hidden');
+      showToast('✨ تم تجهيز واعتماد التقرير بنجاح!');
+    } finally {
+      isSubmittingReport = false;
+      if (btnSubmit) btnSubmit.disabled = false;
+      if (elements.btnConfirmSend) elements.btnConfirmSend.disabled = false;
+    }
   }
 
   // عرض إشعار سريع
@@ -1042,7 +1063,7 @@
 
         // النظافة
         const cleanStr = String(r.cleanliness || '');
-        if (cleanStr.includes('نظيف') || cleanStr.includes('مثالي')) cleanCount++;
+        if (!cleanStr.startsWith('لا') && (cleanStr.includes('نعم') || cleanStr.includes('نظيف') || cleanStr.includes('مثالي'))) cleanCount++;
 
         // العتاد
         const eqStr = String(r.equipmentStatus || '');
